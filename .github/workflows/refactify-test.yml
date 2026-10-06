@@ -1,0 +1,158 @@
+name: Refactify Stress Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - obfuscate
+          - undo
+        default: 'obfuscate'
+      # Untrusted free-text input: it is passed to the run: bodies via the
+      # SNAPSHOT_ID environment variable (never via direct ${{ }} shell
+      # interpolation, which would allow command injection) and validated
+      # against the snapshot ID format before use.
+      snapshot_id:
+        description: 'Snapshot ID (Required only for undo, e.g. snap_20060102_150405_0001)'
+        required: false
+        type: string
+      # Pinned Refactify release tag. "latest" would let a new release
+      # change behavior between runs; the checksums verification below
+      # guarantees the archive matches the tag's published checksum.
+      refactify_version:
+        description: 'Refactify release tag to download (e.g. v2.2.3)'
+        required: true
+        type: string
+        default: 'v2.2.3'
+
+permissions:
+  contents: write
+
+jobs:
+  refactify:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 1. Checkout Target Project
+      uses: actions/checkout@v4
+      with:
+        path: target-project
+        fetch-depth: 0
+
+    - name: 2. Set up Language Toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: 3. Download Refactify CLI from Releases
+      env:
+        GH_TOKEN: ${{ secrets.REFACTIFY_ACTION_KEY }}
+        REFACTIFY_VERSION: ${{ inputs.refactify_version }}
+      run: |
+        cd target-project
+        echo "Downloading Refactify CLI release $REFACTIFY_VERSION..."
+        # Use GitHub CLI to securely download from private repo and handle S3 redirects automatically
+        gh release download "$REFACTIFY_VERSION" --repo switlydev/refactor --pattern "*linux-amd64.tar.gz" --pattern "*checksums*"
+
+        # Verify the archive checksum BEFORE extracting anything: the runner
+        # later executes this binary with write access to the repo.
+        CHECKSUM_FILE=$(ls *checksums* | head -n 1)
+        ARCHIVE_FILE=$(ls *linux-amd64.tar.gz | head -n 1)
+        grep "$ARCHIVE_FILE$" "$CHECKSUM_FILE" | sha256sum -c -
+
+        # Extract the binary from the downloaded archive
+        tar -xzf "$ARCHIVE_FILE" refactify
+        rm "$ARCHIVE_FILE"
+        mv refactify refactify-cli
+        chmod +x refactify-cli
+
+    - name: 4. Generate Default Refactify Config (Obfuscate Only)
+      if: ${{ github.event.inputs.action == 'obfuscate' }}
+      run: |
+        cd target-project
+        rm -f .refactify/config.json || true
+        ./refactify-cli init config --path .
+
+    - name: 5. Run Refactify Action
+      env:
+        # Untrusted inputs reach the shell only through environment
+        # variables: direct ${{ }} interpolation would expand BEFORE the
+        # shell parses the body, letting a crafted input inject commands.
+        ACTION: ${{ github.event.inputs.action }}
+        SNAPSHOT_ID: ${{ github.event.inputs.snapshot_id }}
+      run: |
+        cd target-project
+        if [ "$ACTION" == "obfuscate" ]; then
+          echo "Starting obfuscation..."
+          ./refactify-cli init --rename-files --path . --debug
+        elif [ "$ACTION" == "undo" ]; then
+          echo "Starting undo..."
+          if [ -z "$SNAPSHOT_ID" ]; then
+            echo "ERROR: snapshot_id is required for undo!"
+            exit 1
+          fi
+          # The CLI accepts an ID like snap_20060102_150405_0001 (the
+          # .json.gz suffix belongs to the file, not the ID). Strict format
+          # check before it is ever passed to the tool.
+          if ! echo "$SNAPSHOT_ID" | grep -Eq '^snap_[0-9]{8}_[0-9]{6}_[0-9]{4}$'; then
+            echo "ERROR: invalid snapshot ID format: $SNAPSHOT_ID"
+            exit 1
+          fi
+          ./refactify-cli undo "$SNAPSHOT_ID" --path . --debug
+        else
+          echo "ERROR: unknown action: $ACTION"
+          exit 1
+        fi
+
+    - name: 6. Validate Build (Stress Test)
+      if: ${{ github.event.inputs.action == 'obfuscate' }}
+      run: |
+        cd target-project
+        echo "Testing obfuscated project..."
+        # ripgrep: unit + integration tests (integration tests run against
+        # the built rg binary; onig sanity may be skipped by env).
+        cargo test --workspace
+
+    - name: 7. Commit and Push Changes
+      env:
+        # Same env-indirection pattern as step 5: the untrusted inputs must
+        # never be interpolated directly into the shell body (a crafted
+        # snapshot_id could escape the double quotes of the commit message).
+        ACTION: ${{ github.event.inputs.action }}
+        SNAPSHOT_ID: ${{ github.event.inputs.snapshot_id }}
+      run: |
+        cd target-project
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        # Add all changes (.refactify included). Force add .refactify in
+        # case it is gitignored.
+        git add -A
+        git add -f .refactify/ || true
+
+        if git diff --staged --quiet; then
+          echo "No changes to commit."
+        else
+          if [ "$ACTION" == "obfuscate" ]; then
+            git commit -m "chore(refactify): apply obfuscation"
+          else
+            git commit -m "chore(refactify): undo obfuscation ($SNAPSHOT_ID)"
+          fi
+
+          # Push to whatever branch triggered the run.
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          git push origin HEAD:$BRANCH_NAME
+        fi
+
+    - name: 8. Archive Refactify Report
+      if: ${{ github.event.inputs.action == 'obfuscate' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: refactify-obfuscation-report
+        # The engine writes .refactify/report.md; fail loudly instead of
+        # silently uploading nothing.
+        if-no-files-found: error
+        path: |
+          target-project/.refactify/report.md
+          target-project/.refactify/refactored_names.json
