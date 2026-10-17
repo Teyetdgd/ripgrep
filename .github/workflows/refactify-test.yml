@@ -26,7 +26,7 @@ on:
         description: 'Refactify release tag to download (e.g. v2.2.3)'
         required: true
         type: string
-        default: 'v2.2.3'
+        default: 'v2.2.14'
 
 permissions:
   contents: write
